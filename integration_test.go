@@ -142,6 +142,7 @@ func TestFirstAuthMethodRequiresUser(t *testing.T) {
 	}
 }
 
+// TestTryPasswordsFindsCorrect exercises the default password method.
 func TestTryPasswordsFindsCorrect(t *testing.T) {
 	out, _, code := runProbe("try-passwords", testUser+"@"+sshAddr, "wrong1", "wrong2", testPassword)
 	if code != 0 {
@@ -149,6 +150,26 @@ func TestTryPasswordsFindsCorrect(t *testing.T) {
 	}
 	if got := strings.TrimSpace(out); got != testPassword {
 		t.Errorf("try-passwords = %q, want %q", got, testPassword)
+	}
+}
+
+func TestTryPasswordsKeyboardInteractive(t *testing.T) {
+	out, _, code := runProbe("try-passwords", "--method", "keyboard-interactive", testUser+"@"+sshAddr, "wrong", testPassword)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if got := strings.TrimSpace(out); got != testPassword {
+		t.Errorf("try-passwords --method keyboard-interactive = %q, want %q", got, testPassword)
+	}
+}
+
+func TestTryPasswordsUnknownMethod(t *testing.T) {
+	_, stderr, code := runProbe("try-passwords", "--method", "bogus", testUser+"@"+sshAddr, testPassword)
+	if code == 0 {
+		t.Fatalf("exit code = 0, want non-zero for an unknown method")
+	}
+	if !strings.Contains(stderr, "unknown --method") {
+		t.Errorf("stderr = %q, want it to report an unknown method", strings.TrimSpace(stderr))
 	}
 }
 
@@ -228,12 +249,15 @@ func setup(container string, port int) error {
 	}
 
 	// OpenSSH 10.x enables PerSourcePenalties by default, which blocks a source
-	// IP after accumulated failed authentications. That would make the
-	// try-passwords tests (which deliberately fail some attempts) flaky, so turn
-	// it off and restart sshd to apply it.
+	// IP after accumulated failed authentications and would make the
+	// try-passwords tests (which deliberately fail some attempts) flaky. Also
+	// enable PAM so keyboard-interactive authentication actually validates the
+	// user's password, which is what try-passwords uses by default. Restart
+	// sshd afterwards to apply the changes.
+	cfg := "PerSourcePenalties no\nUsePAM yes\nKbdInteractiveAuthentication yes\n"
 	if out, err := exec.Command("docker", "exec", container, "sh", "-c",
-		`echo "PerSourcePenalties no" >> /config/sshd/sshd_config`).CombinedOutput(); err != nil {
-		return fmt.Errorf("disabling PerSourcePenalties: %v: %s", err, out)
+		"printf '%s' '"+cfg+"' >> /config/sshd/sshd_config").CombinedOutput(); err != nil {
+		return fmt.Errorf("updating sshd config: %v: %s", err, out)
 	}
 	if out, err := exec.Command("docker", "restart", container).CombinedOutput(); err != nil {
 		return fmt.Errorf("docker restart: %v: %s", err, out)

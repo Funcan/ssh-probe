@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"errors"
+	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -54,7 +55,7 @@ Usage:
   ssh-probe supports-password <user@host>
   ssh-probe auth-methods <user@host>
   ssh-probe first-auth-method <user@host>
-  ssh-probe try-passwords <user@host> <password1> [ <password2> ... ]
+  ssh-probe try-passwords [--method password|keyboard-interactive] <user@host> <password1> [ <password2> ... ]
 `)
 }
 
@@ -160,59 +161,143 @@ func cmdFirstAuthMethod(args []string) error {
 }
 
 func cmdTryPasswords(args []string) error {
-	if len(args) < 2 {
-		return fmt.Errorf("usage: ssh-probe try-passwords <user@host> <password1> [ <password2> ... ]")
+	fs := flag.NewFlagSet("try-passwords", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	method := fs.String("method", "password",
+		"authentication method to use: password or keyboard-interactive")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr,
+			"usage: ssh-probe try-passwords [--method password|keyboard-interactive] <user@host> <password1> [ <password2> ... ]")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
 
-	user, addr, err := splitUserHost(args[0])
+	rest := fs.Args()
+	if len(rest) < 2 {
+		fs.Usage()
+		return fmt.Errorf("need a <user@host> and at least one password")
+	}
+
+	user, addr, err := splitUserHost(rest[0])
 	if err != nil {
 		return err
 	}
-	passwords := args[1:]
+	passwords := rest[1:]
 
-	for _, pw := range passwords {
-		ok, err := tryPassword(user, addr, pw)
-		if err != nil {
-			return err
-		}
-		if ok {
-			fmt.Println(pw)
-			return nil
-		}
+	// Validate the method up front so a typo fails before we connect.
+	if _, err := passwordAuth(*method, ""); err != nil {
+		return err
 	}
 
-	return fmt.Errorf("none of the %d supplied passwords were accepted", len(passwords))
+	accepted, err := tryPasswords(user, addr, *method, passwords)
+	if err != nil {
+		return err
+	}
+	if accepted == "" {
+		return fmt.Errorf("none of the %d supplied passwords were accepted", len(passwords))
+	}
+
+	fmt.Println(accepted)
+	return nil
 }
 
-// tryPassword attempts password authentication as user against addr. It returns
-// (true, nil) on success and (false, nil) when the server rejects the password.
-// A network-level failure (so no password can be tried) is returned as an error.
-func tryPassword(user, addr, password string) (bool, error) {
+// passwordAuth builds an auth method that submits the given password using the
+// named SSH method. "keyboard-interactive" answers every PAM prompt with the
+// password, matching what happens when a password is typed at the usual prompt;
+// "password" uses the RFC 4252 "password" method directly.
+func passwordAuth(method, password string) (ssh.AuthMethod, error) {
+	switch method {
+	case "keyboard-interactive":
+		return ssh.KeyboardInteractive(func(_, _ string, questions []string, _ []bool) ([]string, error) {
+			answers := make([]string, len(questions))
+			for i := range answers {
+				answers[i] = password
+			}
+			return answers, nil
+		}), nil
+	case "password":
+		return ssh.Password(password), nil
+	default:
+		return nil, fmt.Errorf("unknown --method %q (want password or keyboard-interactive)", method)
+	}
+}
+
+// tryPasswords tries each password in turn and returns the first the server
+// accepts, or "" if none are. Like a normal SSH client typing several passwords
+// at the prompt, it submits them over a single connection; if the server closes
+// the connection after its per-connection limit before the passwords are
+// exhausted, it reconnects and continues with the rest. A network-level failure
+// is returned as an error.
+func tryPasswords(user, addr, method string, passwords []string) (string, error) {
+	remaining := passwords
+	for len(remaining) > 0 {
+		accepted, tried, err := tryPasswordsOnConn(user, addr, method, remaining)
+		if err != nil {
+			return "", err
+		}
+		if accepted != "" {
+			return accepted, nil
+		}
+		if tried == 0 {
+			// No password could be attempted (e.g. the server does not offer
+			// this method), so reconnecting would not help.
+			break
+		}
+		remaining = remaining[tried:]
+	}
+	return "", nil
+}
+
+// tryPasswordsOnConn opens one connection and submits passwords in order until
+// one is accepted, the list is exhausted, or the server closes the connection.
+// It returns the accepted password (or "") and how many passwords were actually
+// attempted on this connection, so the caller can resume with the rest.
+func tryPasswordsOnConn(user, addr, method string, passwords []string) (string, int, error) {
 	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
-		return false, err
+		return "", 0, err
 	}
 	defer conn.Close()
 
-	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		return false, err
+	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		return "", 0, err
 	}
 
+	idx := -1 // index of the most recent password handed to the server
 	config := &ssh.ClientConfig{
 		User:            user,
-		Auth:            []ssh.AuthMethod{ssh.Password(password)},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		AuthCallback: func(ctx *ssh.ClientAuthContext) (ssh.AuthMethod, error) {
+			if !slices.Contains(ctx.AllowedMethods, method) {
+				return nil, nil // server will not accept this method; give up
+			}
+			if idx+1 >= len(passwords) {
+				return nil, nil // all passwords on this connection exhausted
+			}
+			idx++
+			auth, err := passwordAuth(method, passwords[idx])
+			if err != nil {
+				return nil, err
+			}
+			return auth, nil
+		},
 	}
 
 	sshConn, _, _, err := ssh.NewClientConn(conn, addr, config)
 	if err != nil {
-		// The TCP connection succeeded, so this is an authentication (or
-		// protocol) rejection rather than a network failure: report it as a
-		// failed password so the next one is tried.
-		return false, nil
+		// The TCP connection succeeded, so this is authentication being
+		// rejected (or the server disconnecting us), not a network failure.
+		return "", idx + 1, nil
 	}
 	sshConn.Close()
-	return true, nil
+	if idx < 0 {
+		// Authentication succeeded before any password was tried, i.e. the
+		// server accepted the "none" method.
+		return "", 0, errNoPasswordNeeded
+	}
+	return passwords[idx], idx + 1, nil
 }
 
 // stripUser removes an optional "user@" leader from a target, which commands
@@ -242,6 +327,10 @@ func splitUserHost(target string) (user, addr string, err error) {
 // errCaptured aborts the handshake once the server's offered authentication
 // methods have been captured.
 var errCaptured = errors.New("captured offered authentication methods")
+
+// errNoPasswordNeeded reports that the server authenticated without any
+// password, i.e. it accepted the "none" method.
+var errNoPasswordNeeded = errors.New(`server authenticated without a password (accepted the "none" method)`)
 
 // offeredAuthMethods connects as user and returns the authentication methods
 // the server offers after the initial "none" probe, in the server's order. If
